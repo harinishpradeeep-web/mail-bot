@@ -1,0 +1,20 @@
+node_modules/
+.next/
+out/
+dist/
+*.tsbuildinfo
+next-env.d.ts
+
+# Secrets — never commit
+.env
+.env.local
+.env*.local
+
+# Local SQLite database
+database/*.db
+database/*.db-journal
+database/*.db-wal
+database/*.db-shm
+
+.DS_Store
+coverage/
