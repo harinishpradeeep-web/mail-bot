@@ -3,48 +3,50 @@ import { runDueSchedules } from '@/lib/dispatch';
 import { safeEqual } from '@/lib/crypto';
 
 export const runtime = 'nodejs';
-// Never cache the scheduler tick.
 export const dynamic = 'force-dynamic';
 
 /**
- * The server-side scheduler. Nothing here depends on a browser tab being open.
- *
- * Call it every minute:
- *   • Vercel        → vercel.json "crons" (Pro allows minute granularity;
- *                     on Hobby the minimum is daily, so use an external
- *                     pinger — see README "Running the scheduler")
- *   • Any VPS/cron  → * * * * * curl -H "Authorization: Bearer $CRON_SECRET" \
- *                       https://your-app/api/cron/send-due
- *   • Local dev     → npm run cron:local
- *
- * Auth: Bearer CRON_SECRET. Vercel Cron also sends its own bearer token, which
- * matches when you set CRON_SECRET as a project environment variable.
+ * Server-side scheduler API endpoint.
+ * Accepts authentication via:
+ *   - Bearer token header: Authorization: Bearer <CRON_SECRET>
+ *   - Query parameter: /api/cron/send-due?secret=<CRON_SECRET>
+ *   - Custom header: x-cron-secret: <CRON_SECRET>
  */
 async function handle(req: NextRequest) {
+  const timestamp = new Date().toISOString();
+  console.log(`[NETLIFY CRON API] 📩 Cron endpoint invoked at ${timestamp} (${req.method} ${req.url})`);
+
   const secret = process.env.CRON_SECRET;
   if (!secret) {
-    console.error('[SCHEDULER] Error: CRON_SECRET is not set, so the scheduler cannot run.');
-    return NextResponse.json({ error: 'CRON_SECRET is not set. See .env.example.' }, { status: 500 });
+    console.error('[NETLIFY CRON API] ❌ ERROR: CRON_SECRET is not set in Netlify environment variables!');
+    return NextResponse.json({ error: 'CRON_SECRET is not set in environment variables.' }, { status: 500 });
   }
 
-  const provided = (req.headers.get('authorization') || '').replace(/^Bearer\s+/i, '');
+  const url = new URL(req.url);
+  const querySecret = url.searchParams.get('secret') || url.searchParams.get('token');
+  const headerSecret = (req.headers.get('authorization') || '').replace(/^Bearer\s+/i, '') || req.headers.get('x-cron-secret');
+  const provided = headerSecret || querySecret || '';
+
   if (!provided || !safeEqual(provided, secret)) {
-    console.warn('[SCHEDULER] Rejected a tick with a missing or wrong bearer token.');
-    return NextResponse.json({ error: 'Unauthorised.' }, { status: 401 });
+    console.warn('[NETLIFY CRON API] ⚠️ Authorization failed: missing or invalid CRON_SECRET token.');
+    return NextResponse.json({ error: 'Unauthorised. Missing or invalid CRON_SECRET.' }, { status: 401 });
   }
 
-  console.log('[SCHEDULER] Scheduler started');
+  console.log('[NETLIFY CRON API] ✅ Authorization successful. Checking for due schedules...');
 
   try {
     const result = await runDueSchedules();
-    // Errors are per-recipient messages; they contain no credentials.
     console.log(
-      `[SCHEDULER] Tick complete: due=${result.due} sent=${result.sent} failed=${result.failed} duplicatesSkipped=${result.skippedDuplicates} lockedSkipped=${result.skippedLocked}`
+      `[NETLIFY CRON API] 🚀 Tick complete: due=${result.due}, sent=${result.sent}, failed=${result.failed}, skippedDuplicates=${result.skippedDuplicates}, lockedSkipped=${result.skippedLocked}`
     );
+    if (result.errors.length > 0) {
+      console.error(`[NETLIFY CRON API] ⚠️ Send errors encountered:`, result.errors);
+    }
     return NextResponse.json({ ok: true, ...result });
   } catch (err) {
-    console.error('[SCHEDULER] Error:', err instanceof Error ? err.message : 'unknown error');
-    return NextResponse.json({ error: 'Scheduler run failed.' }, { status: 500 });
+    const message = err instanceof Error ? err.message : 'unknown error';
+    console.error(`[NETLIFY CRON API] ❌ Scheduler run failed with error: ${message}`);
+    return NextResponse.json({ error: 'Scheduler run failed.', details: message }, { status: 500 });
   }
 }
 
