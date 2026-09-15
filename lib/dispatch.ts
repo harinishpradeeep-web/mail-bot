@@ -1,5 +1,13 @@
-import type BetterSqlite3 from 'better-sqlite3';
-import { db } from './db';
+import { db, type AppDb } from './db';
+import {
+  scheduledEmails,
+  scheduledEmailRecipients,
+  recipients,
+  users,
+  emailLogs,
+  schedulerState,
+} from './db/schema';
+import { eq, and, lte, inArray, sql } from 'drizzle-orm';
 import { defaultMailer, type Mailer } from './gmail';
 import { nextOccurrence } from './recurrence';
 import { attachmentContentForSchedule, purgeOrphanUploads } from './attachments';
@@ -12,7 +20,7 @@ import type { RecurrenceSpec, ScheduledEmail, Weekday } from './types';
  */
 
 export interface DispatchDeps {
-  conn?: BetterSqlite3.Database;
+  conn?: AppDb;
   mailer?: Mailer;
   now?: Date;
 }
@@ -39,20 +47,33 @@ export function specOf(row: ScheduledEmail): RecurrenceSpec {
   };
 }
 
-function recipientsFor(conn: BetterSqlite3.Database, scheduleId: number): { name: string; email: string }[] {
-  return conn
-    .prepare(
-      `SELECT r.name, r.email FROM scheduled_email_recipients ser
-       JOIN recipients r ON r.id = ser.recipient_id
-       WHERE ser.scheduled_email_id = ? ORDER BY r.name`
-    )
-    .all(scheduleId) as { name: string; email: string }[];
+async function recipientsFor(
+  conn: AppDb,
+  scheduleId: number
+): Promise<{ name: string; email: string }[]> {
+  const rows = await conn
+    .select({
+      name: recipients.name,
+      email: recipients.email,
+    })
+    .from(scheduledEmailRecipients)
+    .innerJoin(recipients, eq(recipients.id, scheduledEmailRecipients.recipientId))
+    .where(eq(scheduledEmailRecipients.scheduledEmailId, scheduleId))
+    .orderBy(recipients.name);
+  return rows;
 }
 
-function senderAddress(conn: BetterSqlite3.Database, userId: number): string {
-  const row = conn.prepare('SELECT email, name FROM users WHERE id = ?').get(userId) as
-    | { email: string; name: string }
-    | undefined;
+async function senderAddress(conn: AppDb, userId: number): Promise<string> {
+  const rows = await conn
+    .select({
+      email: users.email,
+      name: users.name,
+    })
+    .from(users)
+    .where(eq(users.id, userId))
+    .limit(1);
+
+  const row = rows[0];
   if (!row) throw new Error('The owner of this schedule no longer exists.');
   return row.name ? `${row.name} <${row.email}>` : row.email;
 }
@@ -74,35 +95,43 @@ export async function sendOccurrence(
   const mailer = deps.mailer ?? defaultMailer();
   const out = { sent: 0, failed: 0, skipped: 0, errors: [] as string[] };
 
-  const recipients = recipientsFor(conn, schedule.id);
-  if (recipients.length === 0) {
+  const recs = await recipientsFor(conn, schedule.id);
+  if (recs.length === 0) {
     out.errors.push(`Schedule ${schedule.id} has no recipients left.`);
     return out;
   }
 
-  const from = senderAddress(conn, schedule.user_id);
+  const from = await senderAddress(conn, schedule.user_id);
   // Loaded once per occurrence, reused for every recipient.
-  const attachments = attachmentContentForSchedule(schedule.id, conn).map((file) => ({
+  const rawAttachments = await attachmentContentForSchedule(schedule.id, conn);
+  const attachments = rawAttachments.map((file) => ({
     filename: file.filename,
     mimeType: file.mime_type,
     content: file.content,
   }));
-  const claim = conn.prepare(
-    `INSERT INTO email_logs (scheduled_email_id, recipient_email, occurrence_key, status)
-     VALUES (?, ?, ?, 'pending')`
-  );
 
-  for (const recipient of recipients) {
+  for (const recipient of recs) {
     let logId: number;
     try {
-      logId = Number(claim.run(schedule.id, recipient.email, occurrenceKey).lastInsertRowid);
+      const inserted = await conn
+        .insert(emailLogs)
+        .values({
+          scheduledEmailId: schedule.id,
+          recipientEmail: recipient.email,
+          occurrenceKey: occurrenceKey,
+          status: 'pending',
+        })
+        .returning({ id: emailLogs.id });
+      logId = inserted[0].id;
     } catch {
       out.skipped++; // already claimed by another run — do not resend
       continue;
     }
 
     try {
-      console.log(`[SCHEDULER] Calling Gmail send for schedule ${schedule.id}, recipient #${logId}`);
+      console.log(
+        `[SCHEDULER] Calling Gmail send for schedule ${schedule.id}, recipient #${logId}`
+      );
       await mailer.send({
         userId: schedule.user_id,
         from,
@@ -111,16 +140,27 @@ export async function sendOccurrence(
         body: schedule.body,
         attachments,
       });
-      conn
-        .prepare(`UPDATE email_logs SET status = 'sent', sent_at = ? WHERE id = ?`)
-        .run(new Date().toISOString(), logId);
+
+      await conn
+        .update(emailLogs)
+        .set({ status: 'sent', sentAt: new Date().toISOString() })
+        .where(eq(emailLogs.id, logId));
+
       out.sent++;
-      console.log(`[SCHEDULER] Gmail send successful for schedule ${schedule.id}, log ${logId}`);
+      console.log(
+        `[SCHEDULER] Gmail send successful for schedule ${schedule.id}, log ${logId}`
+      );
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Unknown send error';
-      conn
-        .prepare(`UPDATE email_logs SET status = 'failed', sent_at = ?, error_message = ? WHERE id = ?`)
-        .run(new Date().toISOString(), message.slice(0, 500), logId);
+      await conn
+        .update(emailLogs)
+        .set({
+          status: 'failed',
+          sentAt: new Date().toISOString(),
+          errorMessage: message.slice(0, 500),
+        })
+        .where(eq(emailLogs.id, logId));
+
       out.failed++;
       out.errors.push(`${recipient.email}: ${message}`);
       console.error(`[SCHEDULER] Failed to process schedule: ${schedule.id}`);
@@ -132,42 +172,66 @@ export async function sendOccurrence(
 }
 
 /** Advances a schedule to its next occurrence, or closes it out. */
-export function advanceSchedule(
+export async function advanceSchedule(
   schedule: ScheduledEmail,
   firedAt: Date,
   hadFailure: boolean,
   deps: DispatchDeps = {}
-): void {
+): Promise<void> {
   const conn = deps.conn ?? db();
   const next = schedule.schedule_type === 'repeat' ? nextOccurrence(specOf(schedule), firedAt) : null;
 
   if (next) {
-    conn
-      .prepare(
-        `UPDATE scheduled_emails SET next_send_at = ?, status = 'active', updated_at = ? WHERE id = ?`
-      )
-      .run(next.toISOString(), new Date().toISOString(), schedule.id);
+    await conn
+      .update(scheduledEmails)
+      .set({
+        nextSendAt: next.toISOString(),
+        status: 'active',
+        updatedAt: new Date().toISOString(),
+      })
+      .where(eq(scheduledEmails.id, schedule.id));
     return;
   }
 
-  conn
-    .prepare(`UPDATE scheduled_emails SET next_send_at = NULL, status = ?, updated_at = ? WHERE id = ?`)
-    .run(hadFailure ? 'failed' : 'completed', new Date().toISOString(), schedule.id);
+  await conn
+    .update(scheduledEmails)
+    .set({
+      nextSendAt: null,
+      status: hadFailure ? 'failed' : 'completed',
+      updatedAt: new Date().toISOString(),
+    })
+    .where(eq(scheduledEmails.id, schedule.id));
 }
 
 /** Heartbeat, so "is the scheduler even running?" is answerable from the UI. */
-function recordTick(conn: BetterSqlite3.Database, now: Date, result: DispatchResult): void {
-  conn
-    .prepare(
-      `INSERT INTO scheduler_state (id, last_run_at, last_due, last_sent, last_failed)
-       VALUES (1, ?, ?, ?, ?)
-       ON CONFLICT(id) DO UPDATE SET
-         last_run_at = excluded.last_run_at,
-         last_due = excluded.last_due,
-         last_sent = excluded.last_sent,
-         last_failed = excluded.last_failed`
-    )
-    .run(now.toISOString(), result.due, result.sent, result.failed);
+async function recordTick(conn: AppDb, now: Date, result: DispatchResult): Promise<void> {
+  const nowIso = now.toISOString();
+  // Upsert for row id = 1
+  const existing = await conn
+    .select({ id: schedulerState.id })
+    .from(schedulerState)
+    .where(eq(schedulerState.id, 1))
+    .limit(1);
+
+  if (existing.length > 0) {
+    await conn
+      .update(schedulerState)
+      .set({
+        lastRunAt: nowIso,
+        lastDue: result.due,
+        lastSent: result.sent,
+        lastFailed: result.failed,
+      })
+      .where(eq(schedulerState.id, 1));
+  } else {
+    await conn.insert(schedulerState).values({
+      id: 1,
+      lastRunAt: nowIso,
+      lastDue: result.due,
+      lastSent: result.sent,
+      lastFailed: result.failed,
+    });
+  }
 }
 
 /**
@@ -177,17 +241,19 @@ function recordTick(conn: BetterSqlite3.Database, now: Date, result: DispatchRes
  */
 const STALE_CLAIM_MS = 10 * 60 * 1000;
 
-function releaseStaleClaims(conn: BetterSqlite3.Database, now: Date): void {
+async function releaseStaleClaims(conn: AppDb, now: Date): Promise<void> {
   const cutoff = new Date(now.getTime() - STALE_CLAIM_MS).toISOString();
-  const info = conn
-    .prepare(
-      `UPDATE scheduled_emails
-       SET status = CASE schedule_type WHEN 'repeat' THEN 'active' ELSE 'scheduled' END
-       WHERE status = 'processing' AND updated_at <= ?`
-    )
-    .run(cutoff);
-  if (info.changes > 0) {
-    console.log(`[SCHEDULER] Released ${info.changes} schedule(s) stuck in processing`);
+
+  const released = await conn
+    .update(scheduledEmails)
+    .set({
+      status: sql`CASE WHEN ${scheduledEmails.scheduleType} = 'repeat' THEN 'active' ELSE 'scheduled' END`,
+    })
+    .where(and(eq(scheduledEmails.status, 'processing'), lte(scheduledEmails.updatedAt, cutoff)))
+    .returning({ id: scheduledEmails.id });
+
+  if (released.length > 0) {
+    console.log(`[SCHEDULER] Released ${released.length} schedule(s) stuck in processing`);
   }
 }
 
@@ -196,21 +262,28 @@ function releaseStaleClaims(conn: BetterSqlite3.Database, now: Date): void {
  * caller can move a row out of active/scheduled for a given next_send_at, so a
  * second overlapping cron invocation gets changes === 0 and walks away.
  */
-function claimSchedule(
-  conn: BetterSqlite3.Database,
+async function claimSchedule(
+  conn: AppDb,
   id: number,
   occurrenceKey: string,
   now: Date
-): boolean {
-  // Stamped with the same clock the staleness check uses, so a claim made in
-  // this tick can never be read as abandoned by the next one.
-  const info = conn
-    .prepare(
-      `UPDATE scheduled_emails SET status = 'processing', updated_at = ?
-       WHERE id = ? AND next_send_at = ? AND status IN ('active','scheduled')`
+): Promise<boolean> {
+  const updated = await conn
+    .update(scheduledEmails)
+    .set({
+      status: 'processing',
+      updatedAt: now.toISOString(),
+    })
+    .where(
+      and(
+        eq(scheduledEmails.id, id),
+        eq(scheduledEmails.nextSendAt, occurrenceKey),
+        inArray(scheduledEmails.status, ['active', 'scheduled'])
+      )
     )
-    .run(now.toISOString(), id, occurrenceKey);
-  return info.changes === 1;
+    .returning({ id: scheduledEmails.id });
+
+  return updated.length === 1;
 }
 
 /**
@@ -225,18 +298,40 @@ export async function runDueSchedules(deps: DispatchDeps = {}): Promise<Dispatch
   console.log(`[SCHEDULER] Checking for due schedules`);
   console.log(`[SCHEDULER] Current server time: ${now.toISOString()} (UTC)`);
 
-  releaseStaleClaims(conn, now);
+  await releaseStaleClaims(conn, now);
 
-  const dueRows = conn
-    .prepare(
-      `SELECT * FROM scheduled_emails
-       WHERE status IN ('active','scheduled')
-         AND next_send_at IS NOT NULL
-         AND next_send_at <= ?
-       ORDER BY next_send_at
-       LIMIT 200`
+  const rawRows = await conn
+    .select()
+    .from(scheduledEmails)
+    .where(
+      and(
+        inArray(scheduledEmails.status, ['active', 'scheduled']),
+        sql`${scheduledEmails.nextSendAt} IS NOT NULL`,
+        lte(scheduledEmails.nextSendAt, now.toISOString())
+      )
     )
-    .all(now.toISOString()) as ScheduledEmail[];
+    .orderBy(scheduledEmails.nextSendAt)
+    .limit(200);
+
+  const dueRows: ScheduledEmail[] = rawRows.map((r) => ({
+    id: r.id,
+    user_id: r.userId,
+    subject: r.subject,
+    body: r.body,
+    schedule_type: r.scheduleType as ScheduledEmail['schedule_type'],
+    scheduled_at: r.scheduledAt,
+    timezone: r.timezone,
+    repeat_frequency: r.repeatFrequency as ScheduledEmail['repeat_frequency'],
+    repeat_days: r.repeatDays,
+    repeat_interval_days: r.repeatIntervalDays,
+    start_date: r.startDate,
+    start_time: r.startTime,
+    end_date: r.endDate,
+    next_send_at: r.nextSendAt,
+    status: r.status as ScheduledEmail['status'],
+    created_at: r.createdAt,
+    updated_at: r.updatedAt,
+  }));
 
   console.log(`[SCHEDULER] Found ${dueRows.length} due schedule(s)`);
 
@@ -244,8 +339,7 @@ export async function runDueSchedules(deps: DispatchDeps = {}): Promise<Dispatch
     const occurrenceKey = schedule.next_send_at as string;
     const firedAt = new Date(occurrenceKey);
 
-    // scheduled/active → processing. Losing the race is normal, not an error.
-    if (!claimSchedule(conn, schedule.id, occurrenceKey, now)) {
+    if (!(await claimSchedule(conn, schedule.id, occurrenceKey, now))) {
       result.skippedLocked++;
       console.log(`[SCHEDULER] Schedule ${schedule.id} already claimed by another run, skipping`);
       continue;
@@ -261,28 +355,29 @@ export async function runDueSchedules(deps: DispatchDeps = {}): Promise<Dispatch
       result.skippedDuplicates += attempt.skipped;
       result.errors.push(...attempt.errors);
 
-      // processing → active / scheduled / completed / failed. No retry of this
-      // occurrence: a recurring schedule moves on to its next one.
-      advanceSchedule(schedule, firedAt, attempt.failed > 0 && attempt.sent === 0, { ...deps, conn });
-      const finalStatus = (
-        conn.prepare('SELECT status FROM scheduled_emails WHERE id = ?').get(schedule.id) as { status: string }
-      ).status;
+      await advanceSchedule(schedule, firedAt, attempt.failed > 0 && attempt.sent === 0, { ...deps, conn });
+
+      const check = await conn
+        .select({ status: scheduledEmails.status })
+        .from(scheduledEmails)
+        .where(eq(scheduledEmails.id, schedule.id))
+        .limit(1);
+
+      const finalStatus = check[0]?.status ?? 'unknown';
       console.log(
         `[SCHEDULER] Schedule ${schedule.id} marked as ${finalStatus} (sent=${attempt.sent} failed=${attempt.failed})`
       );
     } catch (err) {
-      // Something outside the per-recipient send failed. Don't leave the row
-      // locked in processing.
       const message = err instanceof Error ? err.message : 'Unknown scheduler error';
       console.error(`[SCHEDULER] Failed to process schedule: ${schedule.id}`);
       console.error(`[SCHEDULER] Error: ${message}`);
       result.failed++;
       result.errors.push(`Schedule ${schedule.id}: ${message}`);
-      advanceSchedule(schedule, firedAt, true, { ...deps, conn });
+      await advanceSchedule(schedule, firedAt, true, { ...deps, conn });
     }
   }
 
-  purgeOrphanUploads(conn, now);
-  recordTick(conn, now, result);
+  await purgeOrphanUploads(conn, now);
+  await recordTick(conn, now, result);
   return result;
 }

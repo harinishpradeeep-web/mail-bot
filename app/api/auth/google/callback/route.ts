@@ -1,5 +1,7 @@
 import { NextResponse, type NextRequest } from 'next/server';
 import { db } from '@/lib/db';
+import { users } from '@/lib/db/schema';
+import { eq } from 'drizzle-orm';
 import { exchangeCode, fetchProfile, saveTokens } from '@/lib/google';
 import { setSession } from '@/lib/session';
 import { unsign } from '@/lib/crypto';
@@ -32,23 +34,33 @@ export async function GET(req: NextRequest) {
     const tokens = await exchangeCode(code);
     const profile = await fetchProfile(tokens.access_token);
 
-    const existing = db().prepare('SELECT id FROM users WHERE google_id = ?').get(profile.sub) as
-      | { id: number }
-      | undefined;
+    const database = db();
+    const existingList = await database
+      .select({ id: users.id })
+      .from(users)
+      .where(eq(users.googleId, profile.sub))
+      .limit(1);
 
     let userId: number;
-    if (existing) {
-      userId = existing.id;
-      db().prepare('UPDATE users SET email = ?, name = ? WHERE id = ?').run(profile.email, profile.name ?? '', userId);
+    if (existingList.length > 0) {
+      userId = existingList[0].id;
+      await database
+        .update(users)
+        .set({ email: profile.email, name: profile.name ?? '' })
+        .where(eq(users.id, userId));
     } else {
-      userId = Number(
-        db()
-          .prepare('INSERT INTO users (google_id, email, name) VALUES (?, ?, ?)')
-          .run(profile.sub, profile.email, profile.name ?? '').lastInsertRowid
-      );
+      const inserted = await database
+        .insert(users)
+        .values({
+          googleId: profile.sub,
+          email: profile.email,
+          name: profile.name ?? '',
+        })
+        .returning({ id: users.id });
+      userId = inserted[0].id;
     }
 
-    saveTokens(userId, tokens);
+    await saveTokens(userId, tokens);
 
     const res = NextResponse.redirect(new URL('/?connected=1', base));
     setSession(res, userId);

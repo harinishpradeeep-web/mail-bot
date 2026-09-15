@@ -1,5 +1,7 @@
 import { NextResponse, type NextRequest } from 'next/server';
 import { db } from '@/lib/db';
+import { attachments } from '@/lib/db/schema';
+import { eq, and } from 'drizzle-orm';
 import { currentUser } from '@/lib/session';
 
 export const runtime = 'nodejs';
@@ -8,8 +10,8 @@ export const runtime = 'nodejs';
  * Serves an attachment file for viewing or downloading.
  * Scoped by user_id so users can only access their own attachments.
  */
-export function GET(req: NextRequest, { params }: { params: { id: string } }) {
-  const user = currentUser(req);
+export async function GET(req: NextRequest, { params }: { params: { id: string } }) {
+  const user = await currentUser(req);
   if (!user) return NextResponse.json({ error: 'Sign in to continue.' }, { status: 401 });
 
   const attId = Number(params.id);
@@ -17,18 +19,19 @@ export function GET(req: NextRequest, { params }: { params: { id: string } }) {
     return NextResponse.json({ error: 'Invalid attachment ID.' }, { status: 400 });
   }
 
-  const row = db()
-    .prepare('SELECT id, filename, mime_type, size_bytes, content FROM attachments WHERE id = ? AND user_id = ?')
-    .get(attId, user.id) as
-    | {
-        id: number;
-        filename: string;
-        mime_type: string;
-        size_bytes: number;
-        content: Buffer;
-      }
-    | undefined;
+  const rows = await db()
+    .select({
+      id: attachments.id,
+      filename: attachments.filename,
+      mime_type: attachments.mimeType,
+      size_bytes: attachments.sizeBytes,
+      content: attachments.content,
+    })
+    .from(attachments)
+    .where(and(eq(attachments.id, attId), eq(attachments.userId, user.id)))
+    .limit(1);
 
+  const row = rows[0];
   if (!row) return NextResponse.json({ error: 'Attachment not found.' }, { status: 404 });
 
   const url = new URL(req.url);
@@ -49,14 +52,15 @@ export function GET(req: NextRequest, { params }: { params: { id: string } }) {
  * Removes one attachment. Scoped by user_id, so nobody can delete another
  * account's file.
  */
-export function DELETE(req: NextRequest, { params }: { params: { id: string } }) {
-  const user = currentUser(req);
+export async function DELETE(req: NextRequest, { params }: { params: { id: string } }) {
+  const user = await currentUser(req);
   if (!user) return NextResponse.json({ error: 'Sign in to continue.' }, { status: 401 });
 
-  const info = db()
-    .prepare('DELETE FROM attachments WHERE id = ? AND user_id = ?')
-    .run(Number(params.id), user.id);
+  const deleted = await db()
+    .delete(attachments)
+    .where(and(eq(attachments.id, Number(params.id)), eq(attachments.userId, user.id)))
+    .returning({ id: attachments.id });
 
-  if (info.changes === 0) return NextResponse.json({ error: 'Attachment not found.' }, { status: 404 });
+  if (deleted.length === 0) return NextResponse.json({ error: 'Attachment not found.' }, { status: 404 });
   return NextResponse.json({ ok: true });
 }

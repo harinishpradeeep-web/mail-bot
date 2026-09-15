@@ -1,94 +1,122 @@
-import type BetterSqlite3 from 'better-sqlite3';
-import { db } from './db';
-
-/**
- * Attachment storage. Server-only: this module touches the database, so it must
- * never be imported by a client component — see lib/attachment-limits.ts for
- * the parts the composer needs.
- *
- * Files are stored as BLOBs in the same SQLite database as everything else, so
- * a scheduled email keeps its attachments until it fires and nothing is written
- * to a public directory.
- */
+import { db, type AppDb } from './db';
+import { attachments } from './db/schema';
+import { eq, and, inArray, notInArray, isNull, or, lte, sql } from 'drizzle-orm';
 
 export * from './attachment-limits';
 import type { AttachmentMeta, StoredAttachment } from './attachment-limits';
 
 /** Total size of a set of the caller's own attachments, for the per-email cap. */
-export function totalBytesOf(userId: number, ids: number[], conn: BetterSqlite3.Database = db()): number {
+export async function totalBytesOf(
+  userId: number,
+  ids: number[],
+  conn: AppDb = db()
+): Promise<number> {
   if (ids.length === 0) return 0;
-  const placeholders = ids.map(() => '?').join(',');
-  const row = conn
-    .prepare(`SELECT COALESCE(SUM(size_bytes), 0) AS total FROM attachments WHERE user_id = ? AND id IN (${placeholders})`)
-    .get(userId, ...ids) as { total: number };
-  return row.total;
+  const result = await conn
+    .select({
+      total: sql<number>`COALESCE(SUM(${attachments.sizeBytes}), 0)`,
+    })
+    .from(attachments)
+    .where(and(eq(attachments.userId, userId), inArray(attachments.id, ids)));
+  return Number(result[0]?.total ?? 0);
 }
 
 /** Metadata only — the BLOB is never sent to the browser. */
-export function attachmentsForSchedule(
+export async function attachmentsForSchedule(
   scheduleId: number,
-  conn: BetterSqlite3.Database = db()
-): AttachmentMeta[] {
-  return conn
-    .prepare(
-      'SELECT id, filename, mime_type, size_bytes FROM attachments WHERE scheduled_email_id = ? ORDER BY id'
-    )
-    .all(scheduleId) as AttachmentMeta[];
+  conn: AppDb = db()
+): Promise<AttachmentMeta[]> {
+  const rows = await conn
+    .select({
+      id: attachments.id,
+      filename: attachments.filename,
+      mime_type: attachments.mimeType,
+      size_bytes: attachments.sizeBytes,
+    })
+    .from(attachments)
+    .where(eq(attachments.scheduledEmailId, scheduleId))
+    .orderBy(attachments.id);
+  return rows;
 }
 
 /** Full rows, including content — used only at send time on the server. */
-export function attachmentContentForSchedule(
+export async function attachmentContentForSchedule(
   scheduleId: number,
-  conn: BetterSqlite3.Database = db()
-): StoredAttachment[] {
-  return conn
-    .prepare(
-      'SELECT id, filename, mime_type, size_bytes, content FROM attachments WHERE scheduled_email_id = ? ORDER BY id'
-    )
-    .all(scheduleId) as StoredAttachment[];
+  conn: AppDb = db()
+): Promise<StoredAttachment[]> {
+  const rows = await conn
+    .select({
+      id: attachments.id,
+      filename: attachments.filename,
+      mime_type: attachments.mimeType,
+      size_bytes: attachments.sizeBytes,
+      content: attachments.content,
+    })
+    .from(attachments)
+    .where(eq(attachments.scheduledEmailId, scheduleId))
+    .orderBy(attachments.id);
+  return rows;
 }
 
 /**
  * Binds uploaded files to a schedule. Only rows the caller owns and that are
  * not already attached elsewhere can be claimed.
  */
-export function linkAttachments(
+export async function linkAttachments(
   userId: number,
   scheduleId: number,
   ids: number[],
-  conn: BetterSqlite3.Database = db()
-): void {
-  const claim = conn.prepare(
-    `UPDATE attachments SET scheduled_email_id = ?
-     WHERE id = ? AND user_id = ? AND (scheduled_email_id IS NULL OR scheduled_email_id = ?)`
-  );
-  for (const id of ids) claim.run(scheduleId, id, userId, scheduleId);
+  conn: AppDb = db()
+): Promise<void> {
+  if (ids.length === 0) return;
+  for (const id of ids) {
+    await conn
+      .update(attachments)
+      .set({ scheduledEmailId: scheduleId })
+      .where(
+        and(
+          eq(attachments.id, id),
+          eq(attachments.userId, userId),
+          or(isNull(attachments.scheduledEmailId), eq(attachments.scheduledEmailId, scheduleId))
+        )
+      );
+  }
 }
 
 /** Used when editing: drop files the user removed from this schedule. */
-export function unlinkRemovedAttachments(
+export async function unlinkRemovedAttachments(
   scheduleId: number,
   keepIds: number[],
-  conn: BetterSqlite3.Database = db()
-): void {
+  conn: AppDb = db()
+): Promise<void> {
   if (keepIds.length === 0) {
-    conn.prepare('DELETE FROM attachments WHERE scheduled_email_id = ?').run(scheduleId);
+    await conn
+      .delete(attachments)
+      .where(eq(attachments.scheduledEmailId, scheduleId));
     return;
   }
-  const placeholders = keepIds.map(() => '?').join(',');
-  conn
-    .prepare(`DELETE FROM attachments WHERE scheduled_email_id = ? AND id NOT IN (${placeholders})`)
-    .run(scheduleId, ...keepIds);
+  await conn
+    .delete(attachments)
+    .where(
+      and(
+        eq(attachments.scheduledEmailId, scheduleId),
+        notInArray(attachments.id, keepIds)
+      )
+    );
 }
 
 /**
  * Uploads that were never attached to anything (composer abandoned) would
  * otherwise sit in the database forever.
  */
-export function purgeOrphanUploads(conn: BetterSqlite3.Database = db(), now: Date = new Date()): number {
+export async function purgeOrphanUploads(
+  conn: AppDb = db(),
+  now: Date = new Date()
+): Promise<number> {
   const cutoff = new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString();
-  const info = conn
-    .prepare('DELETE FROM attachments WHERE scheduled_email_id IS NULL AND created_at <= ?')
-    .run(cutoff);
-  return info.changes;
+  const deleted = await conn
+    .delete(attachments)
+    .where(and(isNull(attachments.scheduledEmailId), lte(attachments.createdAt, cutoff)))
+    .returning({ id: attachments.id });
+  return deleted.length;
 }

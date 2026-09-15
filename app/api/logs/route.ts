@@ -1,59 +1,68 @@
 import { NextResponse, type NextRequest } from 'next/server';
 import { db } from '@/lib/db';
+import { emailLogs, scheduledEmails, scheduledEmailRecipients, recipients, attachments } from '@/lib/db/schema';
+import { eq, and, inArray, desc } from 'drizzle-orm';
 import { currentUser } from '@/lib/session';
 
 export const runtime = 'nodejs';
 
-interface LogRowFromDb {
-  id: number;
-  recipient_email: string;
-  sent_at: string | null;
-  status: string;
-  error_message: string | null;
-  occurrence_key: string;
-  schedule_id: number;
-  subject: string;
-  body: string;
-  timezone: string;
-}
-
 /** Sent history: logs joined to their schedule, scoped to the signed-in user. */
-export function GET(req: NextRequest) {
-  const user = currentUser(req);
+export async function GET(req: NextRequest) {
+  const user = await currentUser(req);
   if (!user) return NextResponse.json({ error: 'Sign in to continue.' }, { status: 401 });
 
-  const rows = db()
-    .prepare(
-      `SELECT l.id, l.recipient_email, l.sent_at, l.status, l.error_message, l.occurrence_key,
-              s.id AS schedule_id, s.subject, s.body, s.timezone
-       FROM email_logs l
-       JOIN scheduled_emails s ON s.id = l.scheduled_email_id
-       WHERE s.user_id = ? AND l.status IN ('sent','failed')
-       ORDER BY l.sent_at DESC, l.id DESC
-       LIMIT 300`
-    )
-    .all(user.id) as LogRowFromDb[];
+  const database = db();
 
-  const recipientsStmt = db().prepare(
-    `SELECT r.id, r.name, r.email FROM scheduled_email_recipients ser
-     JOIN recipients r ON r.id = ser.recipient_id
-     WHERE ser.scheduled_email_id = ? ORDER BY r.name`
-  );
+  const rows = await database
+    .select({
+      id: emailLogs.id,
+      recipient_email: emailLogs.recipientEmail,
+      sent_at: emailLogs.sentAt,
+      status: emailLogs.status,
+      error_message: emailLogs.errorMessage,
+      occurrence_key: emailLogs.occurrenceKey,
+      schedule_id: scheduledEmails.id,
+      subject: scheduledEmails.subject,
+      body: scheduledEmails.body,
+      timezone: scheduledEmails.timezone,
+    })
+    .from(emailLogs)
+    .innerJoin(scheduledEmails, eq(scheduledEmails.id, emailLogs.scheduledEmailId))
+    .where(and(eq(scheduledEmails.userId, user.id), inArray(emailLogs.status, ['sent', 'failed'])))
+    .orderBy(desc(emailLogs.sentAt), desc(emailLogs.id))
+    .limit(300);
 
-  const attachmentsStmt = db().prepare(
-    `SELECT id, filename, mime_type AS mimeType, size_bytes AS sizeBytes
-     FROM attachments WHERE scheduled_email_id = ? ORDER BY id`
-  );
+  const logsWithDetails = [];
 
-  const logsWithDetails = rows.map((log) => {
-    const recipients = recipientsStmt.all(log.schedule_id) as { id: number; name: string; email: string }[];
-    const attachments = attachmentsStmt.all(log.schedule_id) as { id: number; filename: string; mimeType: string; sizeBytes: number }[];
-    return {
+  for (const log of rows) {
+    const recs = await database
+      .select({
+        id: recipients.id,
+        name: recipients.name,
+        email: recipients.email,
+      })
+      .from(scheduledEmailRecipients)
+      .innerJoin(recipients, eq(recipients.id, scheduledEmailRecipients.recipientId))
+      .where(eq(scheduledEmailRecipients.scheduledEmailId, log.schedule_id))
+      .orderBy(recipients.name);
+
+    const atts = await database
+      .select({
+        id: attachments.id,
+        filename: attachments.filename,
+        mimeType: attachments.mimeType,
+        sizeBytes: attachments.sizeBytes,
+      })
+      .from(attachments)
+      .where(eq(attachments.scheduledEmailId, log.schedule_id))
+      .orderBy(attachments.id);
+
+    logsWithDetails.push({
       ...log,
-      recipients: recipients.length > 0 ? recipients : [{ id: 0, name: log.recipient_email, email: log.recipient_email }],
-      attachments,
-    };
-  });
+      recipients: recs.length > 0 ? recs : [{ id: 0, name: log.recipient_email, email: log.recipient_email }],
+      attachments: atts,
+    });
+  }
 
   return NextResponse.json({ logs: logsWithDetails });
 }

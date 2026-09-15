@@ -1,4 +1,6 @@
 import { db } from './db';
+import { users } from './db/schema';
+import { eq } from 'drizzle-orm';
 import { decryptSecret, encryptSecret } from './crypto';
 
 /**
@@ -29,7 +31,6 @@ function config() {
   const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
   const redirectUri = process.env.GOOGLE_REDIRECT_URI;
   if (!clientId || !clientSecret || !redirectUri) {
-    // ⬇️ YOU MUST FILL THESE IN — see GMAIL_SETUP.md and .env.example
     throw new Error(
       'Google OAuth is not configured. Set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET and GOOGLE_REDIRECT_URI in .env (see GMAIL_SETUP.md).'
     );
@@ -48,8 +49,6 @@ export function authUrl(state: string): string {
     redirect_uri: redirectUri,
     response_type: 'code',
     scope: SCOPES.join(' '),
-    // offline + consent is what gets us a refresh_token, which is what lets
-    // the scheduler send while the user is away.
     access_type: 'offline',
     prompt: 'consent',
     include_granted_scopes: 'true',
@@ -79,7 +78,6 @@ export async function exchangeCode(code: string): Promise<TokenResponse> {
     }),
   });
   if (!res.ok) {
-    // Body may echo credentials back; log only the status.
     throw new Error(`Google rejected the authorisation code (HTTP ${res.status}).`);
   }
   return (await res.json()) as TokenResponse;
@@ -91,31 +89,43 @@ export async function fetchProfile(accessToken: string): Promise<{ sub: string; 
   return (await res.json()) as { sub: string; email: string; name?: string };
 }
 
-export function saveTokens(
+export async function saveTokens(
   userId: number,
   tokens: { access_token: string; refresh_token?: string; expires_in: number }
-): void {
+): Promise<void> {
   const expiresAt = new Date(Date.now() + (tokens.expires_in - 60) * 1000).toISOString();
   if (tokens.refresh_token) {
-    db()
-      .prepare(
-        `UPDATE users SET access_token = ?, refresh_token = ?, token_expires_at = ?, gmail_connected = 1 WHERE id = ?`
-      )
-      .run(encryptSecret(tokens.access_token), encryptSecret(tokens.refresh_token), expiresAt, userId);
+    await db()
+      .update(users)
+      .set({
+        accessToken: encryptSecret(tokens.access_token),
+        refreshToken: encryptSecret(tokens.refresh_token),
+        tokenExpiresAt: expiresAt,
+        gmailConnected: 1,
+      })
+      .where(eq(users.id, userId));
   } else {
-    // Google only returns refresh_token on first consent; keep the stored one.
-    db()
-      .prepare(`UPDATE users SET access_token = ?, token_expires_at = ?, gmail_connected = 1 WHERE id = ?`)
-      .run(encryptSecret(tokens.access_token), expiresAt, userId);
+    await db()
+      .update(users)
+      .set({
+        accessToken: encryptSecret(tokens.access_token),
+        tokenExpiresAt: expiresAt,
+        gmailConnected: 1,
+      })
+      .where(eq(users.id, userId));
   }
 }
 
-export function disconnectGmail(userId: number): void {
-  db()
-    .prepare(
-      `UPDATE users SET access_token = NULL, refresh_token = NULL, token_expires_at = NULL, gmail_connected = 0 WHERE id = ?`
-    )
-    .run(userId);
+export async function disconnectGmail(userId: number): Promise<void> {
+  await db()
+    .update(users)
+    .set({
+      accessToken: null,
+      refreshToken: null,
+      tokenExpiresAt: null,
+      gmailConnected: 0,
+    })
+    .where(eq(users.id, userId));
 }
 
 export class TokenExpiredError extends Error {
@@ -127,9 +137,17 @@ export class TokenExpiredError extends Error {
 
 /** Returns a usable access token, refreshing it first if it is close to expiry. */
 export async function getAccessToken(userId: number): Promise<string> {
-  const row = db()
-    .prepare('SELECT access_token, refresh_token, token_expires_at FROM users WHERE id = ?')
-    .get(userId) as { access_token: string | null; refresh_token: string | null; token_expires_at: string | null } | undefined;
+  const rows = await db()
+    .select({
+      access_token: users.accessToken,
+      refresh_token: users.refreshToken,
+      token_expires_at: users.tokenExpiresAt,
+    })
+    .from(users)
+    .where(eq(users.id, userId))
+    .limit(1);
+
+  const row = rows[0];
 
   if (!row || !row.refresh_token) throw new TokenExpiredError('Gmail is not connected for this account.');
 
@@ -150,13 +168,12 @@ export async function getAccessToken(userId: number): Promise<string> {
   });
 
   if (res.status === 400 || res.status === 401) {
-    // Refresh token revoked or expired: force a reconnect instead of retrying.
-    disconnectGmail(userId);
+    await disconnectGmail(userId);
     throw new TokenExpiredError();
   }
   if (!res.ok) throw new Error(`Could not refresh the Google access token (HTTP ${res.status}).`);
 
   const tokens = (await res.json()) as TokenResponse;
-  saveTokens(userId, tokens);
+  await saveTokens(userId, tokens);
   return tokens.access_token;
 }
