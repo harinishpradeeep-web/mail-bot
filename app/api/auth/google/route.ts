@@ -24,5 +24,7 @@ export function GET(_req: NextRequest) {
     path: '/',
     maxAge: 600,
   });
+  console.log("OAuth redirect URI:", process.env.GOOGLE_REDIRECT_URI);
+  console.log("Google client ID:", process.env.GOOGLE_CLIENT_ID);
   return res;
 }
