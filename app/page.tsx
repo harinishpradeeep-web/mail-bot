@@ -13,6 +13,7 @@ interface ScheduleRow extends ScheduledEmail {
   scheduleLabel: string;
 }
 
+
 export default function DashboardPage() {
   const { me } = useSession();
   const [schedules, setSchedules] = useState<ScheduleRow[] | null>(null);
