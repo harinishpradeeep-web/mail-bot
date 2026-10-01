@@ -12,11 +12,14 @@
     "db:generate": "drizzle-kit generate",
     "db:push": "drizzle-kit push",
     "db:migrate": "drizzle-kit migrate",
+    "db:migrate-data": "tsx scripts/migrate-neon-to-supabase.ts",
     "cron:local": "tsx scripts/run-cron-local.ts"
   },
   "dependencies": {
     "@neondatabase/serverless": "^1.1.0",
     "@netlify/functions": "^6.0.0",
+    "@supabase/ssr": "^0.5.2",
+    "@supabase/supabase-js": "^2.48.1",
     "drizzle-orm": "^0.45.2",
     "luxon": "^3.5.0",
     "next": "14.2.15",
