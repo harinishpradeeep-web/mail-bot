@@ -247,7 +247,7 @@ async function releaseStaleClaims(conn: AppDb, now: Date): Promise<void> {
   const released = await conn
     .update(scheduledEmails)
     .set({
-      status: sql`CASE WHEN ${scheduledEmails.scheduleType} = 'repeat' THEN 'active' ELSE 'scheduled' END`,
+      status: sql`CASE WHEN "schedule_type" = 'repeat' THEN 'active' ELSE 'scheduled' END`,
     })
     .where(and(eq(scheduledEmails.status, 'processing'), lte(scheduledEmails.updatedAt, cutoff)))
     .returning({ id: scheduledEmails.id });
